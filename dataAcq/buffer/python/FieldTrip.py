@@ -124,13 +124,8 @@ try:
             if ft == -1:
                 return (DATATYPE_UNKNOWN, None)
 
-            if A.flags['C_CONTIGUOUS']:
-                # great, just use the array's buffer interface
-                return (ft, str(A.data))
-
-            # otherwise, we need a copy to C order
-            AC = A.copy('C')
-            return (ft, str(AC.data))
+            # tobytes() always gives the samples in C order
+            return (ft, A.tobytes())
 
         if isinstance(A, int):
             return (DATATYPE_INT32, struct.pack('i', A))
@@ -422,12 +417,12 @@ class Client:
 
     def putHeader(self, nChannels, fSample, dataType, labels = None, chunks = None):
         haveLabels = False
-        extras = ''
+        extras = b''
         if not(labels is None):
-            serLabels = ''
+            serLabels = b''
             try:
                 for n in range(0,nChannels):
-                    serLabels+=labels[n] + '\0'
+                    serLabels+=labels[n].encode('utf8') + b'\0'
             except:
                 raise ValueError('Channels names (labels), if given, must be a list of N=numChannels strings')
 
@@ -537,7 +532,7 @@ class Client:
         if isinstance(E,Event):
             buf = E.serialize()
         else:
-            buf = ''
+            buf = b''
             num = 0
             for e in E:
                 if not(isinstance(e,Event)):
@@ -558,11 +553,15 @@ class Client:
            quantities in the FieldTrip buffer.
         """
 
-        validatearray()
+        D = numpy.atleast_2d(numpy.asarray(D))
+        if D.ndim != 2:
+            raise ValueError('Data must be a 2-D samples x channels array')
 
-        (nSamp, nChan) = arraysize(D)
+        (nSamp, nChan) = D.shape
 
         (dataType, dataBuf) = serialize(D)
+        if dataType == DATATYPE_UNKNOWN:
+            raise ValueError('Unsupported sample data type: %s'%D.dtype)
 
         dataBufSize = len(dataBuf)
 
