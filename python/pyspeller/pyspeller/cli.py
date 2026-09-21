@@ -104,8 +104,10 @@ def cmd_speller(args):
     client = BufferClient(config.host, config.port).connect(retries=20)
     client.wait_for_header(timeout=60)
     renderer = make_renderer(args.display, SpellerMatrix(config.symbols))
-    clock = (BufferClock(client, config.fsample, config.speed) if config.speed != 1
-             else Clock(1.0))
+    # the amplifier's own rate, not the configured one: they differ as soon as
+    # the data comes from real hardware
+    clock = (BufferClock(client, client.header.fsample, config.speed)
+             if config.speed != 1 else Clock(1.0))
     stimulus = SpellerStimulus(client, config, renderer, clock)
     print('speller ready -- waiting for startPhase.cmd events', flush=True)
     worker = threading.Thread(target=stimulus.run_phase_loop, daemon=True)
@@ -146,7 +148,12 @@ def cmd_demo(args):
 
 
 def cmd_run(args):
-    """Buffer, amplifier, speller, signal processing and GUI in one process."""
+    """Buffer, amplifier, speller, signal processing and GUI in one process.
+
+    With no source given it opens the launcher, so a whole session -- amplifier
+    or simulator, participant, matrix, recording -- can be started with the
+    mouse.  `--lsl` or `--simulate` skip it.
+    """
     from .acquisition.simulator import EEGSimulator
     from .buffer.client import BufferClient
     from .buffer.server import BufferServer
@@ -158,8 +165,17 @@ def cmd_run(args):
     from .speller.stimulus import SpellerStimulus
 
     config = _config_from_args(args)
+    if not (args.lsl or args.simulate):
+        from .gui.launcher import ask_for_session
+        choices = ask_for_session(config)
+        if choices is None:
+            print('nothing to run: no source chosen')
+            return
+        _apply_choices(args, config, choices)
+
     server = simulator = bridge = saver = None
     save_dir = _save_dir(args) if args.save else None
+    source = 'simulated subject'
     if not args.no_buffer:
         server = BufferServer(config.host, config.port).start()
         config.port = server.port
@@ -171,15 +187,19 @@ def cmd_run(args):
                            args.lsl_type).start()
         config.fsample = bridge.fsample
         config.channels = tuple(bridge.labels)
+        source = 'LSL: %s' % (args.lsl_name or args.lsl_type)
     else:
         simulator = EEGSimulator(config, Clock(config.speed),
                                  erp_amplitude=args.erp_amplitude,
                                  noise_amplitude=args.noise_amplitude).start()
 
     stim_client = BufferClient(config.host, config.port).connect(retries=20)
-    stim_client.wait_for_header(timeout=60)
+    header = stim_client.wait_for_header(timeout=60)
     proc_client = BufferClient(config.host, config.port).connect(retries=20)
     proc_client.wait_for_header(timeout=60)
+    config.fsample = header.fsample          # whatever the amplifier reports
+    if header.labels:
+        config.channels = tuple(header.labels)
 
     if save_dir:
         from .acquisition.saver import BufferSaver
@@ -187,11 +207,12 @@ def cmd_run(args):
         save_dir = saver.directory
 
     stop = threading.Event()
-    panel = ControlPanel(config, on_quit=stop.set, recording=save_dir)
+    panel = ControlPanel(config, on_quit=stop.set, recording=save_dir,
+                         source=source)
     renderer = TkRenderer(SpellerMatrix(config.symbols), master=panel.root)
     panel.renderers.append(renderer)
 
-    clock = (BufferClock(stim_client, config.fsample, config.speed)
+    clock = (BufferClock(stim_client, stim_client.header.fsample, config.speed)
              if config.speed != 1 else Clock(1.0))
     stimulus = SpellerStimulus(stim_client, config, renderer, clock)
     processor = SignalProcessor(proc_client, config, save_dir=save_dir)
@@ -209,6 +230,19 @@ def cmd_run(args):
         for component in (saver, simulator, bridge, server):
             if component is not None:
                 component.stop()
+
+
+def _apply_choices(args, config, choices):
+    """Fold what the launcher returned back into the arguments and config."""
+    config.use_layout(choices['layout'])
+    config.n_repetitions = choices['n_repetitions']
+    args.lsl = choices['source'] == 'lsl'
+    args.lsl_name = choices['lsl_name']
+    args.lsl_type = choices['lsl_type']
+    args.save = choices['record']
+    args.subject = choices['subject']
+    args.experiment = choices['experiment']
+    return args
 
 
 def _save_dir(args):
@@ -266,6 +300,8 @@ def build_parser():
         if name == 'run':
             p.add_argument('--no-buffer', action='store_true',
                            help='connect to a buffer that is already running')
+            p.add_argument('--simulate', action='store_true',
+                           help='use the simulated subject without asking')
             p.add_argument('--lsl', action='store_true',
                            help='take data from an LSL device instead of the simulator')
             p.add_argument('--lsl-name', default=None)
